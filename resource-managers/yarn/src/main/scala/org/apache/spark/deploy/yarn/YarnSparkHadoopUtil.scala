@@ -27,8 +27,7 @@ import org.apache.hadoop.yarn.util.ConverterUtils
 
 import org.apache.spark.{SecurityManager, SparkConf}
 import org.apache.spark.launcher.YarnCommandBuilderUtils
-import org.apache.spark.resource.ResourceID
-import org.apache.spark.resource.ResourceUtils._
+import org.apache.spark.resource.ExecutorResourceRequest
 import org.apache.spark.util.Utils
 
 object YarnSparkHadoopUtil {
@@ -38,27 +37,8 @@ object YarnSparkHadoopUtil {
   // the common cases. Memory overhead tends to grow with container size.
 
   val MEMORY_OVERHEAD_FACTOR = 0.10
-  val MEMORY_OVERHEAD_MIN = 384L
 
   val ANY_HOST = "*"
-  val YARN_GPU_RESOURCE_CONFIG = "yarn.io/gpu"
-  val YARN_FPGA_RESOURCE_CONFIG = "yarn.io/fpga"
-
-  /**
-   * Convert Spark resources into YARN resources.
-   * The only resources we know how to map from spark configs to yarn configs are
-   * gpus and fpgas, everything else the user has to specify them in both the
-   * spark.yarn.*.resource and the spark.*.resource configs.
-   */
-  private[yarn] def getYarnResourcesFromSparkResources(
-      confPrefix: String,
-      sparkConf: SparkConf
-      ): Map[String, String] = {
-    Map(GPU -> YARN_GPU_RESOURCE_CONFIG, FPGA -> YARN_FPGA_RESOURCE_CONFIG).map {
-      case (rName, yarnName) =>
-        (yarnName -> sparkConf.get(ResourceID(confPrefix, rName).amountConf, "0"))
-    }.filter { case (_, count) => count.toLong > 0 }
-  }
 
   // All RM requests are issued with same priority : we do not (yet) have any distinction between
   // request types (like map/reduce in hadoop for example)
@@ -126,7 +106,7 @@ object YarnSparkHadoopUtil {
    * Not killing the task leaves various aspects of the executor and (to some extent) the jvm in
    * an inconsistent state.
    * TODO: If the OOM is not recoverable by rescheduling it on different node, then do
-   * 'something' to fail job ... akin to blacklisting trackers in mapred ?
+   * 'something' to fail job ... akin to unhealthy trackers in mapred ?
    *
    * The handler if an OOM Exception is thrown by the JVM must be configured on Windows
    * differently: the 'taskkill' command should be used, whereas Unix-based systems use 'kill'.
@@ -202,4 +182,12 @@ object YarnSparkHadoopUtil {
     ConverterUtils.toContainerId(containerIdString)
   }
 
+  /**
+   * Get offHeap memory size from [[ExecutorResourceRequest]]
+   * return 0 if MEMORY_OFFHEAP_ENABLED is false.
+   */
+  def executorOffHeapMemorySizeAsMb(sparkConf: SparkConf,
+    execRequest: ExecutorResourceRequest): Long = {
+    Utils.checkOffHeapEnabled(sparkConf, execRequest.amount)
+  }
 }

@@ -22,10 +22,12 @@ import java.nio.file.{Files, Paths}
 import scala.collection.JavaConverters._
 import scala.util.Try
 
+import org.scalatest.Assertions._
+
 import org.apache.spark.TestUtils
 import org.apache.spark.api.python.{PythonBroadcast, PythonEvalType, PythonFunction, PythonUtils}
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.internal.config.Tests
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression}
 import org.apache.spark.sql.catalyst.plans.SQLHelper
 import org.apache.spark.sql.execution.python.UserDefinedPythonFunction
 import org.apache.spark.sql.expressions.SparkUserDefinedFunction
@@ -35,8 +37,12 @@ import org.apache.spark.sql.types.StringType
  * This object targets to integrate various UDF test cases so that Scalar UDF, Python UDF and
  * Scalar Pandas UDFs can be tested in SBT & Maven tests.
  *
- * The available UDFs cast input to strings, which take one column as input and return a string
- * type column as output.
+ * The available UDFs are special. It defines an UDF wrapped by cast. So, the input column is
+ * casted into string, UDF returns strings as are, and then output column is casted back to
+ * the input column. In this way, UDF is virtually no-op.
+ *
+ * Note that, due to this implementation limitation, complex types such as map, array and struct
+ * types do not work with this UDFs because they cannot be same after the cast roundtrip.
  *
  * To register Scala UDF in SQL:
  * {{{
@@ -59,22 +65,16 @@ import org.apache.spark.sql.types.StringType
  * To use it in Scala API and SQL:
  * {{{
  *   sql("SELECT udf_name(1)")
- *   spark.range(10).select(expr("udf_name(id)")
- *   spark.range(10).select(pandasTestUDF($"id"))
+ *   val df = spark.range(10)
+ *   df.select(expr("udf_name(id)")
+ *   df.select(pandasTestUDF(df("id")))
  * }}}
  */
 object IntegratedUDFTestUtils extends SQLHelper {
   import scala.sys.process._
 
   private lazy val pythonPath = sys.env.getOrElse("PYTHONPATH", "")
-  private lazy val sparkHome = if (sys.props.contains(Tests.IS_TESTING.key)) {
-    assert(sys.props.contains("spark.test.home") ||
-      sys.env.contains("SPARK_HOME"), "spark.test.home or SPARK_HOME is not set.")
-    sys.props.getOrElse("spark.test.home", sys.env("SPARK_HOME"))
-  } else {
-    assert(sys.env.contains("SPARK_HOME"), "SPARK_HOME is not set.")
-    sys.env("SPARK_HOME")
-  }
+
   // Note that we will directly refer pyspark's source, not the zip from a regular build.
   // It is possible the test is being ran without the build.
   private lazy val sourcePath = Paths.get(sparkHome, "python").toAbsolutePath
@@ -97,7 +97,7 @@ object IntegratedUDFTestUtils extends SQLHelper {
       Seq(
         pythonExec,
         "-c",
-        "from pyspark.sql.utils import require_minimum_pandas_version;" +
+        "from pyspark.sql.pandas.utils import require_minimum_pandas_version;" +
           "require_minimum_pandas_version()"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
@@ -109,20 +109,38 @@ object IntegratedUDFTestUtils extends SQLHelper {
       Seq(
         pythonExec,
         "-c",
-        "from pyspark.sql.utils import require_minimum_pyarrow_version;" +
+        "from pyspark.sql.pandas.utils import require_minimum_pyarrow_version;" +
           "require_minimum_pyarrow_version()"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
     true
   }.getOrElse(false)
 
-  private lazy val pythonVer = if (isPythonAvailable) {
+  lazy val pythonVer: String = if (isPythonAvailable) {
     Process(
       Seq(pythonExec, "-c", "import sys; print('%d.%d' % sys.version_info[:2])"),
       None,
       "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
   } else {
     throw new RuntimeException(s"Python executable [$pythonExec] is unavailable.")
+  }
+
+  lazy val pandasVer: String = if (isPandasAvailable) {
+    Process(
+      Seq(pythonExec, "-c", "import pandas; print(pandas.__version__)"),
+      None,
+      "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
+  } else {
+    throw new RuntimeException("Pandas is unavailable.")
+  }
+
+  lazy val pyarrowVer: String = if (isPyArrowAvailable) {
+    Process(
+      Seq(pythonExec, "-c", "import pyarrow; print(pyarrow.__version__)"),
+      None,
+      "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!.trim()
+  } else {
+    throw new RuntimeException("PyArrow is unavailable.")
   }
 
   // Dynamically pickles and reads the Python instance into JVM side in order to mimic
@@ -137,7 +155,8 @@ object IntegratedUDFTestUtils extends SQLHelper {
           "from pyspark.sql.types import StringType; " +
             "from pyspark.serializers import CloudPickleSerializer; " +
             s"f = open('$path', 'wb');" +
-            s"f.write(CloudPickleSerializer().dumps((lambda x: str(x), StringType())))"),
+            "f.write(CloudPickleSerializer().dumps((" +
+            "lambda x: None if x is None else str(x), StringType())))"),
         None,
         "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
       binaryPythonFunc = Files.readAllBytes(path.toPath)
@@ -158,7 +177,9 @@ object IntegratedUDFTestUtils extends SQLHelper {
           "from pyspark.sql.types import StringType; " +
             "from pyspark.serializers import CloudPickleSerializer; " +
             s"f = open('$path', 'wb');" +
-            s"f.write(CloudPickleSerializer().dumps((lambda x: x.apply(str), StringType())))"),
+            "f.write(CloudPickleSerializer().dumps((" +
+            "lambda x: x.apply(" +
+            "lambda v: None if v is None else str(v)), StringType())))"),
         None,
         "PYTHONPATH" -> s"$pysparkPythonPath:$pythonPath").!!
       binaryPandasFunc = Files.readAllBytes(path.toPath)
@@ -175,7 +196,7 @@ object IntegratedUDFTestUtils extends SQLHelper {
 
   lazy val pythonExec: String = {
     val pythonExec = sys.env.getOrElse(
-      "PYSPARK_DRIVER_PYTHON", sys.env.getOrElse("PYSPARK_PYTHON", "python3.6"))
+      "PYSPARK_DRIVER_PYTHON", sys.env.getOrElse("PYSPARK_PYTHON", "python3"))
     if (TestUtils.testCommandAvailable(pythonExec)) {
       pythonExec
     } else {
@@ -198,11 +219,22 @@ object IntegratedUDFTestUtils extends SQLHelper {
   }
 
   /**
-   * A Python UDF that takes one column and returns a string column.
-   * Equivalent to `udf(lambda x: str(x), "string")`
+   * A Python UDF that takes one column, casts into string, executes the Python native function,
+   * and casts back to the type of input column.
+   *
+   * Virtually equivalent to:
+   *
+   * {{{
+   *   from pyspark.sql.functions import udf
+   *
+   *   df = spark.range(3).toDF("col")
+   *   python_udf = udf(lambda x: str(x), "string")
+   *   casted_col = python_udf(df.col.cast("string"))
+   *   casted_col.cast(df.schema["col"].dataType)
+   * }}}
    */
   case class TestPythonUDF(name: String) extends TestUDF {
-    private[IntegratedUDFTestUtils] lazy val udf = UserDefinedPythonFunction(
+    private[IntegratedUDFTestUtils] lazy val udf = new UserDefinedPythonFunction(
       name = name,
       func = PythonFunction(
         command = pythonFunc,
@@ -214,7 +246,16 @@ object IntegratedUDFTestUtils extends SQLHelper {
         accumulator = null),
       dataType = StringType,
       pythonEvalType = PythonEvalType.SQL_BATCHED_UDF,
-      udfDeterministic = true)
+      udfDeterministic = true) {
+
+      override def builder(e: Seq[Expression]): Expression = {
+        assert(e.length == 1, "Defined UDF only has one column")
+        val expr = e.head
+        assert(expr.resolved, "column should be resolved to use the same type " +
+          "as input. Try df(name) or df.col(name)")
+        Cast(super.builder(Cast(expr, StringType) :: Nil), expr.dataType)
+      }
+    }
 
     def apply(exprs: Column*): Column = udf(exprs: _*)
 
@@ -222,11 +263,22 @@ object IntegratedUDFTestUtils extends SQLHelper {
   }
 
   /**
-   * A Scalar Pandas UDF that takes one column and returns a string column.
-   * Equivalent to `pandas_udf(lambda x: x.apply(str), "string", PandasUDFType.SCALAR)`.
+   * A Scalar Pandas UDF that takes one column, casts into string, executes the
+   * Python native function, and casts back to the type of input column.
+   *
+   * Virtually equivalent to:
+   *
+   * {{{
+   *   from pyspark.sql.functions import pandas_udf
+   *
+   *   df = spark.range(3).toDF("col")
+   *   scalar_udf = pandas_udf(lambda x: x.apply(lambda v: str(v)), "string")
+   *   casted_col = scalar_udf(df.col.cast("string"))
+   *   casted_col.cast(df.schema["col"].dataType)
+   * }}}
    */
   case class TestScalarPandasUDF(name: String) extends TestUDF {
-    private[IntegratedUDFTestUtils] lazy val udf = UserDefinedPythonFunction(
+    private[IntegratedUDFTestUtils] lazy val udf = new UserDefinedPythonFunction(
       name = name,
       func = PythonFunction(
         command = pandasFunc,
@@ -238,7 +290,16 @@ object IntegratedUDFTestUtils extends SQLHelper {
         accumulator = null),
       dataType = StringType,
       pythonEvalType = PythonEvalType.SQL_SCALAR_PANDAS_UDF,
-      udfDeterministic = true)
+      udfDeterministic = true) {
+
+      override def builder(e: Seq[Expression]): Expression = {
+        assert(e.length == 1, "Defined UDF only has one column")
+        val expr = e.head
+        assert(expr.resolved, "column should be resolved to use the same type " +
+          "as input. Try df(name) or df.col(name)")
+        Cast(super.builder(Cast(expr, StringType) :: Nil), expr.dataType)
+      }
+    }
 
     def apply(exprs: Column*): Column = udf(exprs: _*)
 
@@ -246,14 +307,39 @@ object IntegratedUDFTestUtils extends SQLHelper {
   }
 
   /**
-   * A Scala UDF that takes one column and returns a string column.
-   * Equivalent to `udf((input: Any) => input.toString)`.
+   * A Scala UDF that takes one column, casts into string, executes the
+   * Scala native function, and casts back to the type of input column.
+   *
+   * Virtually equivalent to:
+   *
+   * {{{
+   *   import org.apache.spark.sql.functions.udf
+   *
+   *   val df = spark.range(3).toDF("col")
+   *   val scala_udf = udf((input: Any) => input.toString)
+   *   val casted_col = scala_udf(df.col("col").cast("string"))
+   *   casted_col.cast(df.schema("col").dataType)
+   * }}}
    */
   case class TestScalaUDF(name: String) extends TestUDF {
-    private[IntegratedUDFTestUtils] lazy val udf = SparkUserDefinedFunction(
-      (input: Any) => input.toString,
+    private[IntegratedUDFTestUtils] lazy val udf = new SparkUserDefinedFunction(
+      (input: Any) => if (input == null) {
+        null
+      } else {
+        input.toString
+      },
       StringType,
-      inputSchemas = Seq.fill(1)(None))
+      inputEncoders = Seq.fill(1)(None),
+      name = Some(name)) {
+
+      override def apply(exprs: Column*): Column = {
+        assert(exprs.length == 1, "Defined UDF only has one column")
+        val expr = exprs.head.expr
+        assert(expr.resolved, "column should be resolved to use the same type " +
+          "as input. Try df(name) or df.col(name)")
+        Column(Cast(createScalaUDF(Cast(expr, StringType) :: Nil), expr.dataType))
+      }
+    }
 
     def apply(exprs: Column*): Column = udf(exprs: _*)
 

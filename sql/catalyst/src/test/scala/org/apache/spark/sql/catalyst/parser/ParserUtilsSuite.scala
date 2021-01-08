@@ -40,7 +40,7 @@ class ParserUtilsSuite extends SparkFunSuite {
   }
 
   val showDbsContext = buildContext("show databases like 'identifier_with_wildcards'") { parser =>
-    parser.statement().asInstanceOf[ShowDatabasesContext]
+    parser.statement().asInstanceOf[ShowNamespacesContext]
   }
 
   val createDbContext = buildContext(
@@ -50,7 +50,7 @@ class ParserUtilsSuite extends SparkFunSuite {
       |WITH DBPROPERTIES ('a'='a', 'b'='b', 'c'='c')
     """.stripMargin
   ) { parser =>
-    parser.statement().asInstanceOf[CreateDatabaseContext]
+    parser.statement().asInstanceOf[CreateNamespaceContext]
   }
 
   val emptyContext = buildContext("") { parser =>
@@ -94,11 +94,11 @@ class ParserUtilsSuite extends SparkFunSuite {
     assert(unescapeSQLString(""""\256"""") == "256")
 
     // String including a '\u0000' style literal characters (\u732B is a cat in Kanji).
-    assert(unescapeSQLString(""""How cute \u732B are"""")  == "How cute \u732B are")
+    assert(unescapeSQLString("\"How cute \u732B are\"")  == "How cute \u732B are")
 
     // String including a surrogate pair character
     // (\uD867\uDE3D is Okhotsk atka mackerel in Kanji).
-    assert(unescapeSQLString(""""\uD867\uDE3D is a fish"""") == "\uD867\uDE3D is a fish")
+    assert(unescapeSQLString("\"\uD867\uDE3D is a fish\"") == "\uD867\uDE3D is a fish")
 
     // scalastyle:on nonascii
   }
@@ -151,7 +151,7 @@ class ParserUtilsSuite extends SparkFunSuite {
 
   test("string") {
     assert(string(showDbsContext.pattern) == "identifier_with_wildcards")
-    assert(string(createDbContext.comment) == "database_comment")
+    assert(string(createDbContext.commentSpec().get(0).STRING()) == "database_comment")
 
     assert(string(createDbContext.locationSpec.asScala.head.STRING) == "/home/user/db")
   }
